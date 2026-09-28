@@ -1,0 +1,52 @@
+#!/bin/bash
+# Stand-in for ip-config with the same interface, backed by a scratch file
+# instead of NetworkManager. Used to record the README demo without touching
+# real adapters. Open the plugin with it via:
+#   omarchy-shell shell summon ip-config '{"backend": "/path/to/demo/mock-backend"}'
+
+set -uo pipefail
+
+STATE=${IP_CONFIG_DEMO_STATE:-${XDG_RUNTIME_DIR:-/tmp}/ip-config-demo.tsv}
+
+# device type enabled connection method address state saved-static
+[[ -f $STATE ]] || printf '%s\n' \
+  $'wlan0\twifi\t1\tHome Wi-Fi\tauto\t192.168.1.42/24\tconnected\t' \
+  $'eth0\tethernet\t1\tWired connection 1\tauto\t10.0.0.23/24\tconnected\t' >"$STATE"
+
+# update <dev> <awk assignments>
+update() {
+  awk -F'\t' -v OFS='\t' -v dev="$1" "\$1 == dev { $2 } { print }" "$STATE" >"$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+}
+
+field() { awk -F'\t' -v dev="$1" -v n="$2" '$1 == dev { print $n }' "$STATE"; }
+
+case "${1:-}" in
+  list)
+    cut -f1-7 "$STATE"
+    ;;
+  toggle)
+    sleep 0.4
+    if [[ $(field "$2" 3) == 1 ]]; then
+      update "$2" '$3 = 0; $7 = "disconnected"; if ($5 == "auto") $6 = ""'
+    else
+      sleep 0.6
+      update "$2" '$3 = 1; $7 = "connected"; if ($5 == "auto") $6 = ($2 == "wifi" ? "192.168.1.42/24" : "10.0.0.23/24")'
+    fi
+    ;;
+  dhcp)
+    sleep 1.2
+    update "$2" '$5 = "auto"; $6 = ($3 == 1 ? ($2 == "wifi" ? "192.168.1.42/24" : "10.0.0.23/24") : "")'
+    ;;
+  static)
+    read -ra words <<<"${3:-}"
+    ip=${words[0]:-}
+    [[ -n $ip ]] || exit 0
+    [[ ${ip,,} == dhcp ]] && exec "$0" dhcp "$2"
+    [[ $ip == */* ]] || ip="$ip/24"
+    sleep 0.8
+    update "$2" "\$5 = \"manual\"; \$6 = \"$ip\"; \$8 = \"${3}\""
+    ;;
+  prefill)
+    field "$2" 8
+    ;;
+esac

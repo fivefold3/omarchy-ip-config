@@ -1,0 +1,176 @@
+#!/bin/bash
+# NetworkManager backend for the IP config shell plugin.
+#
+#   ip-config list                  One TSV line per Wi-Fi/Ethernet adapter:
+#                                   device type enabled connection method address state
+#   ip-config toggle <dev>          Wi-Fi: radio off/on. Ethernet: disconnect/connect the device.
+#   ip-config dhcp <dev>            Switch to DHCP, saving the current static settings first.
+#   ip-config static <dev> <input>  input = "IP[/mask] [gateway] [dns...]", or "dhcp".
+#                                   A missing mask means /24; missing DNS uses the gateway.
+#   ip-config prefill <dev>         Current static settings, or the ones saved by the last
+#                                   switch to DHCP, as "IP/mask gateway dns...".
+
+set -uo pipefail
+
+# Static settings are saved on the NetworkManager profile itself (as user data),
+# so they survive a switch to DHCP no matter what tool set them.
+SAVED_KEY=ip-config.static-ipv4
+
+notify() { notify-send -a "IP config" "$@"; }
+
+fail() {
+  notify -u critical "$@"
+  exit 1
+}
+
+dev_field() { nmcli -g "$1" dev show "$2" 2>/dev/null; }
+con_field() { nmcli -g "$1" con show "$2" 2>/dev/null; }
+
+# The profile the device is using now, else the most recently used profile for it.
+dev_profile() {
+  local dev=$1 type name iface
+  name=$(dev_field GENERAL.CONNECTION "$dev")
+  if [[ -n $name ]]; then
+    echo "$name"
+    return
+  fi
+  [[ $(dev_field GENERAL.TYPE "$dev") == wifi ]] && type=802-11-wireless || type=802-3-ethernet
+  nmcli -t -f TIMESTAMP,TYPE,NAME con show | sort -t: -k1,1nr |
+    while IFS=: read -r _ t name; do
+      [[ $t == "$type" ]] || continue
+      iface=$(con_field connection.interface-name "$name")
+      if [[ -z $iface || $iface == "$dev" ]]; then
+        echo "$name"
+        break
+      fi
+    done
+}
+
+# nmcli can't read or write profile user data, so this goes through libnm.
+user_data() {
+  python3 - "$@" <<'PY'
+import sys, warnings, gi
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+gi.require_version("NM", "1.0")
+from gi.repository import NM
+
+op, name, key = sys.argv[1:4]
+con = next((c for c in NM.Client.new(None).get_connections() if c.get_id() == name), None)
+if con is None:
+    sys.exit(1)
+setting = con.get_setting(NM.SettingUser)
+if op == "get":
+    print((setting.get_data(key) if setting else None) or "")
+else:
+    if setting is None:
+        setting = NM.SettingUser.new()
+        con.add_setting(setting)
+    setting.set_data(key, sys.argv[4])
+    con.commit_changes(True, None)
+PY
+}
+
+# "IP/mask gateway dns..." from a profile's current ipv4 settings.
+static_line() {
+  local con=$1 addr gw dns
+  addr=$(con_field ipv4.addresses "$con" | cut -d, -f1 | tr -d ' ')
+  gw=$(con_field ipv4.gateway "$con")
+  dns=$(con_field ipv4.dns "$con" | tr ',' ' ')
+  [[ -n $addr ]] && echo "$addr${gw:+ $gw}${dns:+ $dns}"
+}
+
+# Modify the adapter's profile, then reactivate it if the adapter is up.
+# A disabled or unplugged adapter just keeps the saved settings.
+apply() {
+  local dev=$1 con out
+  shift
+  con=$(dev_profile "$dev")
+  [[ -n $con ]] || fail "No profile for $dev"
+  out=$(nmcli con mod "$con" "$@" 2>&1) || fail "Failed: $con" "$out"
+  if [[ -n $(dev_field GENERAL.CONNECTION "$dev") ]]; then
+    out=$(nmcli con up "$con" 2>&1) || fail "Failed: $con" "$out"
+  fi
+}
+
+cmd_list() {
+  local wifi_radio dev type state con enabled method addr
+  wifi_radio=$(nmcli radio wifi)
+  nmcli -t -f DEVICE,TYPE,STATE,CONNECTION dev | while IFS=: read -r dev type state con; do
+    case "$type" in
+      wifi) [[ $wifi_radio == enabled ]] && enabled=1 || enabled=0 ;;
+      ethernet) [[ $state == disconnected || $state == unmanaged ]] && enabled=0 || enabled=1 ;;
+      *) continue ;;
+    esac
+    [[ -n $con ]] || con=$(dev_profile "$dev")
+    method=""
+    [[ -n $con ]] && method=$(con_field ipv4.method "$con")
+    addr=$(dev_field IP4.ADDRESS "$dev" | head -1)
+    # A static adapter that is down still shows its configured address.
+    [[ -z $addr && $method == manual ]] && addr=$(con_field ipv4.addresses "$con" | cut -d, -f1)
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$dev" "$type" "$enabled" "$con" "$method" "$addr" "$state"
+  done
+}
+
+cmd_toggle() {
+  local dev=$1 state out
+  if [[ $(dev_field GENERAL.TYPE "$dev") == wifi ]]; then
+    if [[ $(nmcli radio wifi) == enabled ]]; then
+      nmcli radio wifi off
+    else
+      nmcli radio wifi on
+    fi
+    return
+  fi
+  state=$(dev_field GENERAL.STATE "$dev")
+  if [[ $state == *"(disconnected)"* || $state == *"(unmanaged)"* ]]; then
+    out=$(nmcli dev connect "$dev" 2>&1) || fail "Failed: $dev" "$out"
+  else
+    out=$(nmcli dev disconnect "$dev" 2>&1) || fail "Failed: $dev" "$out"
+  fi
+}
+
+cmd_dhcp() {
+  local dev=$1 con line
+  con=$(dev_profile "$dev")
+  if [[ -n $con && $(con_field ipv4.method "$con") == manual ]]; then
+    line=$(static_line "$con")
+    [[ -n $line ]] && user_data set "$con" "$SAVED_KEY" "$line"
+  fi
+  apply "$dev" ipv4.method auto ipv4.addresses "" ipv4.gateway "" ipv4.dns ""
+}
+
+cmd_static() {
+  local dev=$1 words ip gw dns
+  read -ra words <<<"${2:-}"
+  ip=${words[0]:-}
+  gw=${words[1]:-}
+  dns=$(IFS=,; echo "${words[*]:2}")
+  [[ -n $ip ]] || return 0
+  if [[ ${ip,,} == dhcp ]]; then
+    cmd_dhcp "$dev"
+    return
+  fi
+  [[ $ip == */* ]] || ip="$ip/24"
+  apply "$dev" ipv4.method manual ipv4.addresses "$ip" ipv4.gateway "$gw" ipv4.dns "${dns:-$gw}"
+}
+
+cmd_prefill() {
+  local con
+  con=$(dev_profile "$1")
+  [[ -n $con ]] || return 0
+  if [[ $(con_field ipv4.method "$con") == manual ]]; then
+    static_line "$con"
+  else
+    user_data get "$con" "$SAVED_KEY"
+  fi
+}
+
+case "${1:-}" in
+  list) cmd_list ;;
+  toggle | dhcp | prefill) [[ -n ${2:-} ]] && "cmd_$1" "$2" ;;
+  static) [[ -n ${2:-} ]] && cmd_static "$2" "${3:-}" ;;
+  *)
+    echo "usage: ip-config list | toggle <dev> | dhcp <dev> | static <dev> <input> | prefill <dev>" >&2
+    exit 1
+    ;;
+esac

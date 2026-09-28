@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "ip-config",
+  "name": "IP config",
+  "version": "1.0.0",
+  "author": "fivefold3",
+  "description": "Toggle network adapters and switch them between DHCP and a static IP",
+  "kinds": [
+    "overlay"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "overlay": "IpConfig.qml"
+  }
+}

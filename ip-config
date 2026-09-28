@@ -3,12 +3,18 @@
 #
 #   ip-config list                  One TSV line per Wi-Fi/Ethernet adapter:
 #                                   device type enabled connection method address state
+#                                   lease-expiry (epoch seconds, DHCP only)
 #   ip-config toggle <dev>          Wi-Fi: radio off/on. Ethernet: disconnect/connect the device.
 #   ip-config dhcp <dev>            Switch to DHCP, saving the current static settings first.
 #   ip-config static <dev> <input>  input = "IP[/mask] [gateway] [dns...]", or "dhcp".
 #                                   A missing mask means /24; missing DNS uses the gateway.
+#   ip-config watch                 Stream DHCP progress for all adapters (see cmd_watch).
+#   ip-config setup-logging         Optional, run by hand: turn on DHCP packet logging (root).
 #   ip-config prefill <dev>         Current static settings, or the ones saved by the last
 #                                   switch to DHCP, as "IP/mask gateway dns...".
+#
+# dhcp and static report the connection stages while it comes back up, one
+# "status<TAB>text" line per stage. DHCP packet steps come from `watch`.
 
 set -uo pipefail
 
@@ -28,25 +34,49 @@ con_field() { nmcli -g "$1" con show "$2" 2>/dev/null; }
 
 # The profile the device is using now, else the most recently used profile for it.
 dev_profile() {
-  local dev=$1 type name iface
-  name=$(dev_field GENERAL.CONNECTION "$dev")
+  local dev=$1 type name t ts best="" best_ts=-1 key val
+  local -a names=()
+  local -A stamp iface
+  # Type and active profile in one call.
+  { read -r t; IFS= read -r name; } < <(nmcli -g GENERAL.TYPE,GENERAL.CONNECTION dev show "$dev" 2>/dev/null)
   if [[ -n $name ]]; then
     echo "$name"
     return
   fi
-  [[ $(dev_field GENERAL.TYPE "$dev") == wifi ]] && type=802-11-wireless || type=802-3-ethernet
-  nmcli -t -f TIMESTAMP,TYPE,NAME con show | sort -t: -k1,1nr |
-    while IFS=: read -r _ t name; do
-      [[ $t == "$type" ]] || continue
-      iface=$(con_field connection.interface-name "$name")
-      if [[ -z $iface || $iface == "$dev" ]]; then
-        echo "$name"
-        break
-      fi
-    done
+  [[ $t == wifi ]] && type=802-11-wireless || type=802-3-ethernet
+  while IFS=: read -r t ts name; do
+    [[ $t == "$type" ]] || continue
+    name=${name//\\:/:}
+    names+=("$name")
+    stamp[$name]=$ts
+  done < <(nmcli -t -f TYPE,TIMESTAMP,NAME con show)
+  ((${#names[@]})) || return 0
+  while IFS= read -r line; do
+    key=${line%%:*}
+    val=${line#*:}
+    case "$key" in
+      connection.id) name=$val ;;
+      connection.interface-name) iface[$name]=$val ;;
+    esac
+  done < <(nmcli -t -e no -f connection.id,connection.interface-name con show "${names[@]}")
+  for name in "${names[@]}"; do
+    [[ -z ${iface[$name]:-} || ${iface[$name]} == "$dev" ]] || continue
+    if ((${stamp[$name]:-0} > best_ts)); then best=$name; best_ts=${stamp[$name]:-0}; fi
+  done
+  [[ -n $best ]] && echo "$best"
 }
 
-# nmcli can't read or write profile user data, so this goes through libnm.
+# A profile's saved user data, read over D-Bus (much faster than starting libnm).
+user_data_get() {
+  local con=$1 key=$2 path
+  path=$(nmcli -t -f NAME,DBUS-PATH con show | awk -F: -v n="$con" '$1 == n { print $2 }')
+  [[ -n $path ]] || return 0
+  gdbus call --system --dest org.freedesktop.NetworkManager --object-path "$path" \
+    --method org.freedesktop.NetworkManager.Settings.Connection.GetSettings |
+    grep -o "'$key': '[^']*'" | sed "s/^'$key': '//; s/'\$//"
+}
+
+# nmcli can't write profile user data, so saving goes through libnm.
 user_data() {
   python3 - "$@" <<'PY'
 import sys, warnings, gi
@@ -79,6 +109,57 @@ static_line() {
   [[ -n $addr ]] && echo "$addr${gw:+ $gw}${dns:+ $dns}"
 }
 
+status() { printf 'status\t%s\n' "$1"; }
+
+# NetworkManager device state -> progress text. NM's DHCP client doesn't expose
+# the individual DHCP packets, so this is as fine-grained as it gets.
+stage_text() {
+  local method=$1
+  case "${2%% *}" in
+    110) echo "Releasing old address…" ;;
+    40) echo "Preparing…" ;;
+    50) echo "Configuring link…" ;;
+    60) echo "Authenticating…" ;;
+    70) [[ $method == auto ]] && echo "Requesting DHCP lease…" || echo "Setting address…" ;;
+    80) echo "Checking address…" ;;
+    90) echo "Starting…" ;;
+  esac
+}
+
+# DHCP packets (Discover, Offer, Request, Ack) only reach the journal when
+# NetworkManager's DHCP4 log domain is at DEBUG; see cmd_setup_logging.
+dhcp_logging() { nmcli general logging | grep -qE 'DHCP4:(DEBUG|TRACE)'; }
+
+
+# Bring the profile up, reporting each stage of the activation as it happens.
+# DHCP itself is reported by `ip-config watch`, which the plugin runs while open.
+activate() {
+  local dev=$1 con=$2 method out pid rc code text last=""
+  method=$(con_field ipv4.method "$con")
+  out=$(mktemp)
+  nmcli con up "$con" >"$out" 2>&1 &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    code=$(dev_field GENERAL.STATE "$dev")
+    code=${code%% *}
+    # For DHCP, the watcher's packet steps replace the generic "requesting" stage.
+    if [[ $method == auto && $code == 70 ]]; then text=""; else text=$(stage_text "$method" "$code"); fi
+    if [[ -n $text && $text != "$last" ]]; then
+      status "$text"
+      last=$text
+    fi
+    sleep 0.15
+  done
+  wait "$pid"
+  rc=$?
+  if ((rc != 0)); then
+    notify -u critical "Failed: $con" "$(cat "$out")"
+    rm -f "$out"
+    exit 1
+  fi
+  rm -f "$out"
+}
+
 # Modify the adapter's profile, then reactivate it if the adapter is up.
 # A disabled or unplugged adapter just keeps the saved settings.
 apply() {
@@ -88,26 +169,139 @@ apply() {
   [[ -n $con ]] || fail "No profile for $dev"
   out=$(nmcli con mod "$con" "$@" 2>&1) || fail "Failed: $con" "$out"
   if [[ -n $(dev_field GENERAL.CONNECTION "$dev") ]]; then
-    out=$(nmcli con up "$con" 2>&1) || fail "Failed: $con" "$out"
+    activate "$dev" "$con"
   fi
 }
 
+# Follows NetworkManager's journal and reports DHCP progress for every adapter,
+# whoever started it (this plugin, a cable being plugged in, a reconnect):
+#   event<TAB>device<TAB>text     (empty text: the lease is done)
+# Steps are reported as they happen; the plugin paces them for display.
+cmd_watch() {
+  local line dev ip text
+  declare -A last canceled
+  coproc JOURNAL { exec journalctl -u NetworkManager -f -n 0 -o cat 2>/dev/null; }
+  trap 'kill "$JOURNAL_PID" 2>/dev/null' EXIT
+  trap 'exit 0' TERM INT
+  while IFS= read -r line <&"${JOURNAL[0]}"; do
+    [[ $line =~ dhcp4\ \(([^\)]+)\):\ (.*) ]] || continue
+    dev=${BASH_REMATCH[1]}
+    line=${BASH_REMATCH[2]}
+    ip=""
+    [[ $line =~ \ of\ ([0-9.]+) ]] && ip=${BASH_REMATCH[1]}
+    # Tearing a connection down logs "canceled DHCP transaction" immediately
+    # followed by a "beginning transaction" that never goes anywhere; skip it.
+    if [[ $line == "canceled DHCP transaction"* ]]; then
+      canceled[$dev]=1
+      continue
+    fi
+    if [[ -n ${canceled[$dev]:-} ]]; then
+      unset "canceled[$dev]"
+      [[ $line == "activation: beginning transaction"* ]] && continue
+    fi
+    case "$line" in
+      "activation: beginning transaction"*) text="Starting DHCP…" ;;
+      "event: send DISCOVER"*) text="Discover…" ;;
+      "event: received OFFER"*) text="Offer${ip:+ $ip}" ;;
+      "event: send REQUEST"*) text="Request${ip:+ $ip}" ;;
+      "event: received ACK"*) text="Ack${ip:+ $ip}" ;;
+      "event: received NACK"*) text="Nak, retrying…" ;;
+      "state changed new lease, address="*"acd pending"*) text="Checking for conflicts…" ;;
+      "state changed new lease, address="*) text="" ;;
+      *) continue ;;
+    esac
+    [[ -n $text && $text == "${last[$dev]:-}" ]] && continue
+    last[$dev]=$text
+    printf 'event\t%s\t%s\n' "$dev" "$text"
+  done
+}
+
+# Optional setup, run by the user: raise NetworkManager's DHCP4 logging to
+# DEBUG (now and across reboots) so the watcher can show individual DHCP
+# packets. Needs root, via polkit. The plugin itself never runs this.
+cmd_setup_logging() {
+  if dhcp_logging; then
+    echo "DHCP packet logging is already on."
+    return 0
+  fi
+  pkexec /bin/sh -c '
+    mkdir -p /etc/NetworkManager/conf.d &&
+    install -m644 "$1" /etc/NetworkManager/conf.d/90-ip-config-dhcp-log.conf &&
+    nmcli general logging level INFO domains DEFAULT,DHCP4:DEBUG' sh "$(dirname "$(readlink -f "$0")")/extras/90-ip-config-dhcp-log.conf" &&
+    echo "DHCP packet logging is on."
+}
+
+# Runs every 1.5s while the menu is open, so it makes four nmcli calls in
+# total rather than several per adapter.
 cmd_list() {
-  local wifi_radio dev type state con enabled method addr
+  local wifi_radio key val dev type state con enabled method addr expiry name t ts
+  local -a devs=() profiles=()
+  local -A dtype dstate dcon daddr dexpiry ptype pstamp piface pmethod paddr
   wifi_radio=$(nmcli radio wifi)
-  nmcli -t -f DEVICE,TYPE,STATE,CONNECTION dev | while IFS=: read -r dev type state con; do
+
+  # Every device in one call: blocks of KEY:VALUE lines.
+  while IFS= read -r line; do
+    key=${line%%:*}
+    val=${line#*:}
+    case "$key" in
+      GENERAL.DEVICE) dev=$val; devs+=("$dev") ;;
+      GENERAL.TYPE) dtype[$dev]=$val ;;
+      GENERAL.STATE) val=${val#* (}; dstate[$dev]=${val%)} ;;
+      GENERAL.CONNECTION) dcon[$dev]=$val ;;
+      IP4.ADDRESS\[1\]) daddr[$dev]=$val ;;
+      DHCP4.OPTION*) [[ $val == "expiry = "* ]] && dexpiry[$dev]=${val#expiry = } ;;
+    esac
+  done < <(nmcli -t -f GENERAL.DEVICE,GENERAL.TYPE,GENERAL.STATE,GENERAL.CONNECTION,IP4.ADDRESS,DHCP4.OPTION dev show)
+
+  # Wi-Fi/Ethernet profiles. NAME goes last since it may itself contain colons.
+  while IFS=: read -r t ts name; do
+    [[ $t == 802-11-wireless || $t == 802-3-ethernet ]] || continue
+    name=${name//\\:/:}
+    profiles+=("$name")
+    ptype[$name]=$t
+    pstamp[$name]=$ts
+  done < <(nmcli -t -f TYPE,TIMESTAMP,NAME con show)
+
+  # Their settings, again in one call.
+  if ((${#profiles[@]})); then
+    while IFS= read -r line; do
+      key=${line%%:*}
+      val=${line#*:}
+      case "$key" in
+        connection.id) name=$val ;;
+        connection.interface-name) piface[$name]=$val ;;
+        ipv4.method) pmethod[$name]=$val ;;
+        ipv4.addresses) paddr[$name]=${val%%,*} ;;
+      esac
+    done < <(nmcli -t -e no -f connection.id,connection.interface-name,ipv4.method,ipv4.addresses con show "${profiles[@]}")
+  fi
+
+  for dev in "${devs[@]}"; do
+    type=${dtype[$dev]}
+    state=${dstate[$dev]}
     case "$type" in
       wifi) [[ $wifi_radio == enabled ]] && enabled=1 || enabled=0 ;;
       ethernet) [[ $state == disconnected || $state == unmanaged ]] && enabled=0 || enabled=1 ;;
       *) continue ;;
     esac
-    [[ -n $con ]] || con=$(dev_profile "$dev")
-    method=""
-    [[ -n $con ]] && method=$(con_field ipv4.method "$con")
-    addr=$(dev_field IP4.ADDRESS "$dev" | head -1)
+    con=${dcon[$dev]:-}
+    if [[ -z $con ]]; then
+      # Not connected: the most recently used profile that fits this device.
+      [[ $type == wifi ]] && t=802-11-wireless || t=802-3-ethernet
+      ts=-1
+      for name in "${profiles[@]}"; do
+        [[ ${ptype[$name]} == "$t" ]] || continue
+        [[ -z ${piface[$name]:-} || ${piface[$name]} == "$dev" ]] || continue
+        if ((${pstamp[$name]:-0} > ts)); then con=$name; ts=${pstamp[$name]:-0}; fi
+      done
+    fi
+    method=${pmethod[$con]:-}
+    addr=${daddr[$dev]:-}
     # A static adapter that is down still shows its configured address.
-    [[ -z $addr && $method == manual ]] && addr=$(con_field ipv4.addresses "$con" | cut -d, -f1)
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$dev" "$type" "$enabled" "$con" "$method" "$addr" "$state"
+    [[ -z $addr && $method == manual ]] && addr=${paddr[$con]:-}
+    expiry=""
+    [[ $method == auto && -n $addr ]] && expiry=${dexpiry[$dev]:-}
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$dev" "$type" "$enabled" "$con" "$method" "$addr" "$state" "$expiry"
   done
 }
 
@@ -122,6 +316,8 @@ cmd_toggle() {
     return
   fi
   state=$(dev_field GENERAL.STATE "$dev")
+  # Unplugged: nothing to disconnect, and connecting can't succeed.
+  [[ $state == *"(unavailable)"* ]] && return 0
   if [[ $state == *"(disconnected)"* || $state == *"(unmanaged)"* ]]; then
     out=$(nmcli dev connect "$dev" 2>&1) || fail "Failed: $dev" "$out"
   else
@@ -161,12 +357,14 @@ cmd_prefill() {
   if [[ $(con_field ipv4.method "$con") == manual ]]; then
     static_line "$con"
   else
-    user_data get "$con" "$SAVED_KEY"
+    user_data_get "$con" "$SAVED_KEY"
   fi
 }
 
 case "${1:-}" in
   list) cmd_list ;;
+  watch) cmd_watch ;;
+  setup-logging) cmd_setup_logging ;;
   toggle | dhcp | prefill) [[ -n ${2:-} ]] && "cmd_$1" "$2" ;;
   static) [[ -n ${2:-} ]] && cmd_static "$2" "${3:-}" ;;
   *)

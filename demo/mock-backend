@@ -22,7 +22,8 @@ field() { awk -F'\t' -v dev="$1" -v n="$2" '$1 == dev { print $n }' "$STATE"; }
 
 case "${1:-}" in
   list)
-    cut -f1-7 "$STATE"
+    expiry=$(($(date +%s) + 43200 - 1080))
+    awk -F'\t' -v OFS='\t' -v expiry="$expiry" '{ print $1, $2, $3, $4, $5, $6, $7, ($5 == "auto" && $6 != "" ? expiry : "") }' "$STATE"
     ;;
   toggle)
     sleep 0.4
@@ -34,8 +35,17 @@ case "${1:-}" in
     fi
     ;;
   dhcp)
-    sleep 1.2
-    update "$2" '$5 = "auto"; $6 = ($3 == 1 ? ($2 == "wifi" ? "192.168.1.42/24" : "10.0.0.23/24") : "")'
+    # Replays the progress lines ip-config streams with DHCP packet logging on.
+    if [[ $(field "$2" 3) == 1 ]]; then
+      [[ $(field "$2" 2) == wifi ]] && ip=192.168.1.42 || ip=10.0.0.23
+      for step in "Releasing old address…" "Starting DHCP…" "Discover…" "Offer $ip" "Request $ip" "Ack $ip" "Checking for conflicts…"; do
+        printf 'status\t%s\n' "$step"
+        sleep 0.5
+      done
+      update "$2" "\$5 = \"auto\"; \$6 = \"$ip/24\""
+    else
+      update "$2" '$5 = "auto"; $6 = ""'
+    fi
     ;;
   static)
     read -ra words <<<"${3:-}"
@@ -43,6 +53,7 @@ case "${1:-}" in
     [[ -n $ip ]] || exit 0
     [[ ${ip,,} == dhcp ]] && exec "$0" dhcp "$2"
     [[ $ip == */* ]] || ip="$ip/24"
+    printf 'status\t%s\n' "Setting address…"
     sleep 0.8
     update "$2" "\$5 = \"manual\"; \$6 = \"$ip\"; \$8 = \"${3}\""
     ;;

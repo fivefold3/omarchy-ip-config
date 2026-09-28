@@ -42,10 +42,11 @@ pause 1.8
 key Down 1
 key Right 0.9
 type_slowly "10.0.0.50/24 10.0.0.1 1.1.1.1"
-key Return 2.2
+key Return 2.6
 
-# Back to DHCP, then Static again: the old address is prefilled.
-key Left 2.2
+# Back to DHCP (each DHCP step plays out), then Static again: the old
+# address is prefilled.
+key Left 6.5
 key Right 2.0
 key Escape 1.2
 

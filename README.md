@@ -6,7 +6,7 @@ A small [Omarchy](https://omarchy.org) shell plugin for flipping network adapter
 
 ## Features
 
-- **One row per adapter** (Wi-Fi and Ethernet), showing its current IP address, or its state if it has none (Off, No cable, Connecting…).
+- **One row per adapter** (Wi-Fi and Ethernet): the network name, with the adapter name and its IP address or state (Off, No cable, Connecting…) underneath.
 - **DHCP and Static buttons** on each row. The active mode is highlighted.
 - **Static IP in one line:** `10.0.0.50/24 10.0.0.1 1.1.1.1`. A missing mask means `/24`, and if you leave out DNS the gateway is used. Typing `dhcp` switches back.
 - **Remembers your old static IP.** Switching to DHCP saves the static settings on the NetworkManager profile, whether this plugin or another tool set them. Opening Static later fills them back in.

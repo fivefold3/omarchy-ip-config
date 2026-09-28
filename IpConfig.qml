@@ -180,8 +180,9 @@ Item {
     return row.enabled ? "󰈀" : "󰈂"
   }
 
+  // Subtitle: the adapter name, then its IP and/or state.
   function detailFor(row) {
-    if (root.busyDevices[row.device]) return "Working…"
+    if (root.busyDevices[row.device]) return row.device + " · Working…"
     var status = ""
     if (!row.enabled) status = "Off"
     else if (row.state === "unavailable") status = "No cable"
@@ -189,7 +190,7 @@ Item {
     else if (!row.address) status = "Not connected"
     // Static adapters always show their configured IP, even when down.
     var ip = row.address && (row.method === "manual" || !status) ? row.address : ""
-    return [ip, status].filter(function(s) { return s }).join(" · ")
+    return [row.device, ip, status].filter(function(s) { return s }).join(" · ")
   }
 
   // --- Processes ---

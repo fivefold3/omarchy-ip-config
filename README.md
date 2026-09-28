@@ -7,7 +7,7 @@ A small [Omarchy](https://omarchy.org) shell plugin for flipping network adapter
 ## Features
 
 - **One row per adapter** (Wi-Fi and Ethernet). Each row shows the network name, and under it the adapter name, the IP address and the remaining DHCP lease time. The lease time reads `11h` or `3d`, and `exp.` if the lease has run out. If there's no address, the row shows the state instead: Off, No cable or Connecting….
-- **DHCP and Static buttons** on each row. The active mode is highlighted. It switches the moment you choose it, without waiting for NetworkManager.
+- **DHCP and Static buttons** on each row. The active mode is highlighted. It switches the moment you choose it, without waiting for NetworkManager. Changes go to the profile named on the row: the active one, or for a disconnected adapter its most recently used one. Choosing DHCP on a profile that's already DHCP only renews the lease.
 - **Static IP in one line:** `10.0.0.50/24 10.0.0.1 1.1.1.1`. A missing mask means `/24`, and if you leave out DNS the gateway is used. The field only accepts digits, dots, `/` and spaces.
 - **Remembers your old static IP.** Switching to DHCP saves the static settings on the NetworkManager profile, whether this plugin or another tool set them. Opening Static later fills them back in.
 - **Live DHCP progress** under each adapter while it connects, including connections NetworkManager starts on its own, like plugging in a cable. See [DHCP progress](#dhcp-progress).
@@ -51,6 +51,8 @@ If you turned on DHCP packet logging, turn it off again first:
 ~/.config/omarchy/plugins/io.github.fivefold3.ip-config/ip-config remove-logging
 ```
 
+If you removed the plugin before doing that, the file it wrote is `/etc/NetworkManager/conf.d/90-ip-config-dhcp-log.conf`. Its first line names this plugin, and deleting it (as root) restores NetworkManager's default DHCP logging on the next restart.
+
 Saved static settings stay on your NetworkManager profiles under the `ip-config.static-ipv4` key. They're harmless, and other tools ignore them.
 
 ## Keys
@@ -89,7 +91,7 @@ Out of the box you get the connection stages, e.g. `Releasing old address…`, `
 ~/.config/omarchy/plugins/io.github.fivefold3.ip-config/ip-config setup-logging
 ```
 
-That asks for your password, then writes `/etc/NetworkManager/conf.d/90-ip-config-dhcp-log.conf` and applies it immediately. The file adds `DHCP4:DEBUG` to NetworkManager's logging domains and changes nothing else: every other domain and the overall log level stay as they are. It carries a marker line identifying it as this plugin's, and the command refuses to overwrite a file at that path it didn't create. `ip-config remove-logging` deletes the file (only if it carries the marker) and puts DHCP4 logging back to inheriting the default.
+That asks for your password, then writes `/etc/NetworkManager/conf.d/90-ip-config-dhcp-log.conf` and applies it immediately. The file adds `DHCP4:DEBUG` to NetworkManager's logging domains and changes nothing else: every other domain and the overall log level stay as they are. It carries a marker line identifying it as this plugin's. The command refuses to touch that path if it's a symlink or a file the plugin didn't write (the file written by earlier releases, 1.0.0–1.1.0, is recognised and upgraded), and it writes through a temp file so nothing is ever partially overwritten. `ip-config remove-logging` deletes the file under the same rules and puts DHCP4 logging back to inheriting the default. Both refuse to do anything if NetworkManager isn't answering.
 
 When renewing an address it already had, the client skips Discover and Offer, so you'll see only Request and Ack.
 
@@ -114,6 +116,13 @@ ip-config remove-logging        # undo setup-logging
 `static` and `dhcp` report their stages as `status<TAB>text` lines while the connection comes back up. `watch` reports DHCP steps as `event<TAB>device<TAB>text` lines, where empty text means the lease is done.
 
 Saved static settings are stored on the NetworkManager profile under the `ip-config.static-ipv4` key. They're read over D-Bus and written through libnm, since `nmcli` can't write a profile's user data.
+
+The overlay's open payload can name a different backend script (`{"backend": "/path"}`); the demo recorder uses this to run against a mock. It runs as your user, like the plugin itself, so it grants nothing that `omarchy-shell` IPC doesn't already.
+
+## Limitations
+
+- **IPv4 only.** IPv6 addressing and DHCPv6 aren't shown or configurable; the static prompt only accepts an IPv4 address line.
+- **Wi-Fi off/on is the radio switch**, the same one the bar uses. With more than one Wi-Fi adapter, they go off and on together.
 
 ## Re-recording the demo
 

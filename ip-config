@@ -69,8 +69,13 @@ dev_profile() {
 
 # A profile's saved user data, read over D-Bus (much faster than starting libnm).
 user_data_get() {
-  local con=$1 key=$2 path
-  path=$(nmcli -t -f NAME,DBUS-PATH con show | awk -F: -v n="$con" '$1 == n { print $2 }')
+  local con=$1 key=$2 path="" line name
+  # DBUS-PATH first: it has no colons, while the (escaped) name may.
+  while IFS= read -r line; do
+    name=${line#*:}
+    name=${name//\\:/:}
+    if [[ $name == "$con" ]]; then path=${line%%:*}; break; fi
+  done < <(nmcli -t -f DBUS-PATH,NAME con show)
   [[ -n $path ]] || return 0
   gdbus call --system --dest org.freedesktop.NetworkManager --object-path "$path" \
     --method org.freedesktop.NetworkManager.Settings.Connection.GetSettings |
@@ -86,18 +91,27 @@ gi.require_version("NM", "1.0")
 from gi.repository import NM
 
 op, name, key = sys.argv[1:4]
-con = next((c for c in NM.Client.new(None).get_connections() if c.get_id() == name), None)
-if con is None:
-    sys.exit(1)
-setting = con.get_setting(NM.SettingUser)
-if op == "get":
-    print((setting.get_data(key) if setting else None) or "")
-else:
+
+def run():
+    con = next((c for c in NM.Client.new(None).get_connections() if c.get_id() == name), None)
+    if con is None:
+        sys.exit(1)
+    setting = con.get_setting(NM.SettingUser)
+    if op == "get":
+        print((setting.get_data(key) if setting else None) or "")
+        return
     if setting is None:
         setting = NM.SettingUser.new()
         con.add_setting(setting)
     setting.set_data(key, sys.argv[4])
     con.commit_changes(True, None)
+
+# A profile that changed under us ("no longer in the client cache") is
+# transient; a fresh client sees the current one.
+try:
+    run()
+except Exception:
+    run()
 PY
 }
 
@@ -127,24 +141,26 @@ stage_text() {
   esac
 }
 
-# DHCP packets (Discover, Offer, Request, Ack) only reach the journal when
-# NetworkManager's DHCP4 log domain is at DEBUG; see cmd_setup_logging.
-dhcp_logging() { nmcli general logging | grep -qE 'DHCP4:(DEBUG|TRACE)'; }
-
+# Reading NetworkManager's journal needs wheel, systemd-journal or adm membership.
+journal_readable() { [[ -n $(journalctl -u NetworkManager -n 1 -q -o cat 2>/dev/null) ]]; }
 
 # Bring the profile up, reporting each stage of the activation as it happens.
 # DHCP itself is reported by `ip-config watch`, which the plugin runs while open.
 activate() {
-  local dev=$1 con=$2 method out pid rc code text last=""
+  local dev=$1 con=$2 method out pid rc code text last="" packets=0
   method=$(con_field ipv4.method "$con")
+  # The watcher's DHCP packet steps stand in for the generic "requesting"
+  # stage, but only when it can read the journal.
+  [[ $method == auto ]] && journal_readable && packets=1
   out=$(mktemp)
-  nmcli con up "$con" >"$out" 2>&1 &
+  # ifname pins the activation to this adapter; Wi-Fi profiles usually aren't
+  # bound to one, and NM could otherwise bring the profile up elsewhere.
+  nmcli con up "$con" ifname "$dev" >"$out" 2>&1 &
   pid=$!
   while kill -0 "$pid" 2>/dev/null; do
     code=$(dev_field GENERAL.STATE "$dev")
     code=${code%% *}
-    # For DHCP, the watcher's packet steps replace the generic "requesting" stage.
-    if [[ $method == auto && $code == 70 ]]; then text=""; else text=$(stage_text "$method" "$code"); fi
+    if ((packets)) && [[ $code == 70 ]]; then text=""; else text=$(stage_text "$method" "$code"); fi
     if [[ -n $text && $text != "$last" ]]; then
       status "$text"
       last=$text
@@ -219,66 +235,114 @@ cmd_watch() {
 
 # Optional DHCP packet logging, set up and removed by the user by hand (the
 # plugin never runs these). Both need root, via polkit, and touch only:
-#   - LOG_CONF, which carries LOG_MARKER so it's never mistaken for, or
-#     written over, a file this plugin didn't create;
+#   - LOG_CONF, which must be absent or a regular file this plugin wrote
+#     (the marker line, or the header of the pre-marker file from 1.0.0–1.1.0);
 #   - the DHCP4 entry of NetworkManager's log domains. Every other domain and
 #     the overall level stay as they are, now and in the saved config.
 LOG_CONF=/etc/NetworkManager/conf.d/90-ip-config-dhcp-log.conf
 LOG_MARKER="# Managed by the IP config Omarchy plugin (io.github.fivefold3.ip-config)."
+LOG_OLD_HEADER="# Optional, for the IP config plugin: log DHCPv4 packets (DISCOVER, OFFER,"
 
-# Current runtime log level and domains, with DHCP4 set to $1 ("" = inherit).
-logging_with_dhcp4() {
-  local level domains
-  IFS=: read -r level domains < <(nmcli -t -f LEVEL,DOMAINS general logging)
-  domains=${domains//\\:/:}   # nmcli -t escapes colons
-  domains=$(tr ',' '\n' <<<"$domains" | grep -v '^DHCP4\(:.*\)\?$' | paste -sd,)
-  echo "$level"
-  echo "${domains:+$domains,}DHCP4${1:+:$1}"
+log_conf_is_ours() { grep -qxF -e "$LOG_MARKER" -e "$LOG_OLD_HEADER" "$1" 2>/dev/null; }
+
+# Why LOG_CONF can't be touched, or nothing if it can. Checked as the user
+# before asking for a password; the privileged side checks again.
+log_conf_problem() {
+  if [[ -L $LOG_CONF ]]; then
+    echo "$LOG_CONF is a symlink; leaving it alone."
+  elif [[ -e $LOG_CONF && -r $LOG_CONF ]] && ! log_conf_is_ours "$LOG_CONF"; then
+    echo "$LOG_CONF was not created by this plugin; leaving it alone."
+  fi
+  # Unreadable: can't tell from here; the privileged check decides.
+}
+
+# The same guard for the privileged POSIX sh scripts below ($conf, $marker
+# and $old are set by the caller). Symlinks are refused rather than followed.
+# The values it receives are also checked there, so nothing unexpected is
+# written as root even though they come from the same user.
+LOG_CONF_GUARD='
+  dir=$(dirname "$conf")
+  if [ -L "$dir" ] || [ -L "$conf" ]; then echo "$conf is or is under a symlink; leaving it alone." >&2; exit 3; fi
+  if [ -e "$conf" ] && ! grep -qxF -e "$marker" -e "$old" "$conf"; then
+    echo "$conf was not created by this plugin; leaving it alone." >&2
+    exit 3
+  fi
+  case "$level" in INFO|WARN|ERR|DEBUG|TRACE|OFF) ;; *) echo "unexpected log level: $level" >&2; exit 1 ;; esac
+  case "$domains" in *[!A-Z0-9:,_-]*|"") echo "unexpected log domains: $domains" >&2; exit 1 ;; esac
+'
+
+# Runtime log level and domains into LOG_LEVEL / LOG_DOMAINS; fails when
+# NetworkManager isn't answering, so nothing is changed on a guess.
+read_logging() {
+  IFS=: read -r LOG_LEVEL LOG_DOMAINS < <(nmcli -t -f LEVEL,DOMAINS general logging 2>/dev/null)
+  LOG_DOMAINS=${LOG_DOMAINS//\\:/:}   # nmcli -t escapes colons
+  [[ -n $LOG_LEVEL ]]
+}
+
+dhcp4_debug() { [[ ,$LOG_DOMAINS, == *,DHCP4:DEBUG,* || ,$LOG_DOMAINS, == *,DHCP4:TRACE,* ]]; }
+
+# LOG_DOMAINS with the DHCP4 entry set to $1 ("" = inherit the level).
+domains_with_dhcp4() {
+  local rest
+  rest=$(tr ',' '\n' <<<"$LOG_DOMAINS" | grep -v '^DHCP4\(:.*\)\?$' | paste -sd,)
+  echo "${rest:+$rest,}DHCP4${1:+:$1}"
+}
+
+# The domains line to write. Keep the one already in our file. For a fresh
+# file, add to any domains setting elsewhere in the config rather than
+# replacing it; with none set, "+=" alone would leave only DHCP4 enabled, so
+# include the defaults. The merged config is consulted only when our file is
+# absent, since otherwise it would just reflect our own contribution.
+log_conf_line() {
+  local existing
+  if [[ -f $LOG_CONF ]]; then
+    existing=$(grep -m1 '^domains+=' "$LOG_CONF" 2>/dev/null) && { echo "$existing"; return; }
+    echo "domains+=DEFAULT,DHCP4:DEBUG"   # the pre-marker file replaced domains= outright; play safe
+  elif NetworkManager --print-config 2>/dev/null | grep -q '^domains='; then
+    echo "domains+=DHCP4:DEBUG"
+  else
+    echo "domains+=DEFAULT,DHCP4:DEBUG"
+  fi
 }
 
 cmd_setup_logging() {
-  local line level domains
-  if dhcp_logging && grep -qxF "$LOG_MARKER" "$LOG_CONF" 2>/dev/null; then
+  local problem line
+  problem=$(log_conf_problem)
+  [[ -z $problem ]] || { echo "$problem" >&2; return 3; }
+  read_logging || { echo "NetworkManager isn't answering; is it running?" >&2; return 1; }
+  if dhcp4_debug && [[ -f $LOG_CONF ]] && grep -qxF "$LOG_MARKER" "$LOG_CONF" 2>/dev/null \
+      && grep -q '^domains+=' "$LOG_CONF" 2>/dev/null; then
     echo "DHCP packet logging is already on."
     return 0
   fi
-  # Add to an existing domains setting rather than replacing it. With none
-  # set, "+=" alone would leave only DHCP4 enabled, so include the defaults.
-  if NetworkManager --print-config 2>/dev/null | grep -q '^domains='; then
-    line="domains+=DHCP4:DEBUG"
-  else
-    line="domains+=DEFAULT,DHCP4:DEBUG"
-  fi
-  { read -r level; read -r domains; } < <(logging_with_dhcp4 DEBUG)
-  pkexec /bin/sh -c '
-    conf=$1 marker=$2 line=$3 level=$4 domains=$5
-    if [ -e "$conf" ] && ! grep -qxF "$marker" "$conf"; then
-      echo "$conf already exists and was not created by this plugin; leaving it alone." >&2
-      exit 3
-    fi
-    mkdir -p "$(dirname "$conf")" &&
-      printf "%s\n%s\n%s\n" "$marker" "[logging]" "$line" >"$conf" &&
-      chmod 644 "$conf" &&
+  line=$(log_conf_line)
+  # Written to a temp file and renamed into place, so nothing at the path is
+  # ever followed or partially overwritten.
+  pkexec /bin/sh -c 'conf=$1 marker=$2 old=$3 line=$4 level=$5 domains=$6'"$LOG_CONF_GUARD"'
+    case "$line" in "domains+="*) ;; *) echo "unexpected config line: $line" >&2; exit 1 ;; esac
+    case "${line#domains+=}" in *[!A-Z0-9:,_-]*|"") echo "unexpected config line: $line" >&2; exit 1 ;; esac
+    mkdir -p "$dir" && tmp=$(mktemp "$dir/.ip-config.XXXXXX") || exit 1
+    trap '\''rm -f "$tmp"'\'' EXIT
+    printf "%s\n%s\n%s\n" "$marker" "[logging]" "$line" >"$tmp" &&
+      chmod 644 "$tmp" && mv -f "$tmp" "$conf" &&
       nmcli general logging level "$level" domains "$domains"
-  ' sh "$LOG_CONF" "$LOG_MARKER" "$line" "$level" "$domains" &&
+  ' sh "$LOG_CONF" "$LOG_MARKER" "$LOG_OLD_HEADER" "$line" "$LOG_LEVEL" "$(domains_with_dhcp4 DEBUG)" &&
     echo "DHCP packet logging is on."
 }
 
 cmd_remove_logging() {
-  local level domains
-  if [[ -e $LOG_CONF ]] && ! grep -qxF "$LOG_MARKER" "$LOG_CONF"; then
-    echo "$LOG_CONF was not created by this plugin; leaving it alone." >&2
-    return 3
+  local problem
+  problem=$(log_conf_problem)
+  [[ -z $problem ]] || { echo "$problem" >&2; return 3; }
+  read_logging || { echo "NetworkManager isn't answering; is it running?" >&2; return 1; }
+  if ! dhcp4_debug && [[ ! -e $LOG_CONF && ! -L $LOG_CONF ]]; then
+    echo "DHCP packet logging is already off."
+    return 0
   fi
-  { read -r level; read -r domains; } < <(logging_with_dhcp4 "")
-  pkexec /bin/sh -c '
-    conf=$1 marker=$2 level=$3 domains=$4
-    if [ -e "$conf" ]; then
-      grep -qxF "$marker" "$conf" || { echo "$conf was not created by this plugin; leaving it alone." >&2; exit 3; }
-      rm -f "$conf"
-    fi
+  pkexec /bin/sh -c 'conf=$1 marker=$2 old=$3 level=$4 domains=$5'"$LOG_CONF_GUARD"'
+    if [ -e "$conf" ]; then rm -f "$conf" || exit 1; fi
     nmcli general logging level "$level" domains "$domains"
-  ' sh "$LOG_CONF" "$LOG_MARKER" "$level" "$domains" &&
+  ' sh "$LOG_CONF" "$LOG_MARKER" "$LOG_OLD_HEADER" "$LOG_LEVEL" "$(domains_with_dhcp4 "")" &&
     echo "DHCP packet logging is off."
 }
 
@@ -346,7 +410,8 @@ cmd_list() {
         if ((${pstamp[$name]:-0} > ts)); then con=$name; ts=${pstamp[$name]:-0}; fi
       done
     fi
-    method=${pmethod[$con]:-}
+    method=""
+    [[ -n $con ]] && method=${pmethod[$con]:-}
     addr=${daddr[$dev]:-}
     # A static adapter that is down still shows its configured address.
     [[ -z $addr && $method == manual ]] && addr=${paddr[$con]:-}
@@ -379,10 +444,15 @@ cmd_toggle() {
 cmd_dhcp() {
   local dev=$1 con line
   con=$(dev_profile "$dev")
-  if [[ -n $con && $(con_field ipv4.method "$con") == manual ]]; then
-    line=$(static_line "$con")
-    [[ -n $line ]] && user_data set "$con" "$SAVED_KEY" "$line"
+  [[ -n $con ]] || fail "No profile for $dev"
+  if [[ $(con_field ipv4.method "$con") != manual ]]; then
+    # Already DHCP: just renew. The profile (including any DNS override the
+    # user set on it) is left exactly as it is.
+    [[ -n $(dev_field GENERAL.CONNECTION "$dev") ]] && activate "$dev" "$con"
+    return
   fi
+  line=$(static_line "$con")
+  [[ -n $line ]] && user_data set "$con" "$SAVED_KEY" "$line"
   apply "$dev" ipv4.method auto ipv4.addresses "" ipv4.gateway "" ipv4.dns ""
 }
 

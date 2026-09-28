@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.fivefold3.ip-config",
   "name": "IP config",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "author": "fivefold3",
   "description": "Toggle network adapters and switch them between DHCP and a static IP",
   "kinds": [

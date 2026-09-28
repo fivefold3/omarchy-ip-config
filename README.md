@@ -45,11 +45,10 @@ omarchy plugin remove io.github.fivefold3.ip-config
 
 Then delete the `o.bind(...)` line from `~/.config/hypr/bindings.lua`.
 
-If you turned on DHCP packet logging, turn it off again:
+If you turned on DHCP packet logging, turn it off again first:
 
 ```sh
-sudo rm /etc/NetworkManager/conf.d/90-ip-config-dhcp-log.conf
-sudo nmcli general logging level INFO domains DEFAULT
+~/.config/omarchy/plugins/io.github.fivefold3.ip-config/ip-config remove-logging
 ```
 
 Saved static settings stay on your NetworkManager profiles under the `ip-config.static-ipv4` key. They're harmless, and other tools ignore them.
@@ -90,7 +89,9 @@ Out of the box you get the connection stages, e.g. `Releasing old address…`, `
 ~/.config/omarchy/plugins/io.github.fivefold3.ip-config/ip-config setup-logging
 ```
 
-That asks for your password, installs `extras/90-ip-config-dhcp-log.conf` into `/etc/NetworkManager/conf.d/`, and applies it immediately. It raises logging only for the DHCP part of NetworkManager. When renewing an address it already had, the client skips Discover and Offer, so you'll see only Request and Ack.
+That asks for your password, then writes `/etc/NetworkManager/conf.d/90-ip-config-dhcp-log.conf` and applies it immediately. The file adds `DHCP4:DEBUG` to NetworkManager's logging domains and changes nothing else: every other domain and the overall log level stay as they are. It carries a marker line identifying it as this plugin's, and the command refuses to overwrite a file at that path it didn't create. `ip-config remove-logging` deletes the file (only if it carries the marker) and puts DHCP4 logging back to inheriting the default.
+
+When renewing an address it already had, the client skips Discover and Offer, so you'll see only Request and Ack.
 
 Reading the journal needs membership of `wheel` or `systemd-journal`, which Omarchy users normally have. Without it, the menu shows only the stages NetworkManager reports directly, such as `Releasing old address…` and `Checking address…`.
 
@@ -107,6 +108,7 @@ ip-config dhcp eth0
 ip-config prefill eth0          # what the static prompt would open with
 ip-config watch                 # DHCP progress for all adapters, as it happens
 ip-config setup-logging         # optional, see above
+ip-config remove-logging        # undo setup-logging
 ```
 
 `static` and `dhcp` report their stages as `status<TAB>text` lines while the connection comes back up. `watch` reports DHCP steps as `event<TAB>device<TAB>text` lines, where empty text means the lease is done.

@@ -10,6 +10,7 @@
 #                                   A missing mask means /24; missing DNS uses the gateway.
 #   ip-config watch                 Stream DHCP progress for all adapters (see cmd_watch).
 #   ip-config setup-logging         Optional, run by hand: turn on DHCP packet logging (root).
+#   ip-config remove-logging        Undo setup-logging (root).
 #   ip-config prefill <dev>         Current static settings, or the ones saved by the last
 #                                   switch to DHCP, as "IP/mask gateway dns...".
 #
@@ -216,19 +217,69 @@ cmd_watch() {
   done
 }
 
-# Optional setup, run by the user: raise NetworkManager's DHCP4 logging to
-# DEBUG (now and across reboots) so the watcher can show individual DHCP
-# packets. Needs root, via polkit. The plugin itself never runs this.
+# Optional DHCP packet logging, set up and removed by the user by hand (the
+# plugin never runs these). Both need root, via polkit, and touch only:
+#   - LOG_CONF, which carries LOG_MARKER so it's never mistaken for, or
+#     written over, a file this plugin didn't create;
+#   - the DHCP4 entry of NetworkManager's log domains. Every other domain and
+#     the overall level stay as they are, now and in the saved config.
+LOG_CONF=/etc/NetworkManager/conf.d/90-ip-config-dhcp-log.conf
+LOG_MARKER="# Managed by the IP config Omarchy plugin (io.github.fivefold3.ip-config)."
+
+# Current runtime log level and domains, with DHCP4 set to $1 ("" = inherit).
+logging_with_dhcp4() {
+  local level domains
+  IFS=: read -r level domains < <(nmcli -t -f LEVEL,DOMAINS general logging)
+  domains=${domains//\\:/:}   # nmcli -t escapes colons
+  domains=$(tr ',' '\n' <<<"$domains" | grep -v '^DHCP4\(:.*\)\?$' | paste -sd,)
+  echo "$level"
+  echo "${domains:+$domains,}DHCP4${1:+:$1}"
+}
+
 cmd_setup_logging() {
-  if dhcp_logging; then
+  local line level domains
+  if dhcp_logging && grep -qxF "$LOG_MARKER" "$LOG_CONF" 2>/dev/null; then
     echo "DHCP packet logging is already on."
     return 0
   fi
+  # Add to an existing domains setting rather than replacing it. With none
+  # set, "+=" alone would leave only DHCP4 enabled, so include the defaults.
+  if NetworkManager --print-config 2>/dev/null | grep -q '^domains='; then
+    line="domains+=DHCP4:DEBUG"
+  else
+    line="domains+=DEFAULT,DHCP4:DEBUG"
+  fi
+  { read -r level; read -r domains; } < <(logging_with_dhcp4 DEBUG)
   pkexec /bin/sh -c '
-    mkdir -p /etc/NetworkManager/conf.d &&
-    install -m644 "$1" /etc/NetworkManager/conf.d/90-ip-config-dhcp-log.conf &&
-    nmcli general logging level INFO domains DEFAULT,DHCP4:DEBUG' sh "$(dirname "$(readlink -f "$0")")/extras/90-ip-config-dhcp-log.conf" &&
+    conf=$1 marker=$2 line=$3 level=$4 domains=$5
+    if [ -e "$conf" ] && ! grep -qxF "$marker" "$conf"; then
+      echo "$conf already exists and was not created by this plugin; leaving it alone." >&2
+      exit 3
+    fi
+    mkdir -p "$(dirname "$conf")" &&
+      printf "%s\n%s\n%s\n" "$marker" "[logging]" "$line" >"$conf" &&
+      chmod 644 "$conf" &&
+      nmcli general logging level "$level" domains "$domains"
+  ' sh "$LOG_CONF" "$LOG_MARKER" "$line" "$level" "$domains" &&
     echo "DHCP packet logging is on."
+}
+
+cmd_remove_logging() {
+  local level domains
+  if [[ -e $LOG_CONF ]] && ! grep -qxF "$LOG_MARKER" "$LOG_CONF"; then
+    echo "$LOG_CONF was not created by this plugin; leaving it alone." >&2
+    return 3
+  fi
+  { read -r level; read -r domains; } < <(logging_with_dhcp4 "")
+  pkexec /bin/sh -c '
+    conf=$1 marker=$2 level=$3 domains=$4
+    if [ -e "$conf" ]; then
+      grep -qxF "$marker" "$conf" || { echo "$conf was not created by this plugin; leaving it alone." >&2; exit 3; }
+      rm -f "$conf"
+    fi
+    nmcli general logging level "$level" domains "$domains"
+  ' sh "$LOG_CONF" "$LOG_MARKER" "$level" "$domains" &&
+    echo "DHCP packet logging is off."
 }
 
 # Runs every 1.5s while the menu is open, so it makes four nmcli calls in
@@ -365,6 +416,7 @@ case "${1:-}" in
   list) cmd_list ;;
   watch) cmd_watch ;;
   setup-logging) cmd_setup_logging ;;
+  remove-logging) cmd_remove_logging ;;
   toggle | dhcp | prefill) [[ -n ${2:-} ]] && "cmd_$1" "$2" ;;
   static) [[ -n ${2:-} ]] && cmd_static "$2" "${3:-}" ;;
   *)

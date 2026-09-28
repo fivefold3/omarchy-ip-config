@@ -119,7 +119,7 @@ Item {
   function dismiss() {
     root.opened = false
     if (root.shell && typeof root.shell.hide === "function")
-      root.shell.hide((root.manifest && root.manifest.id) || "ip-config")
+      root.shell.hide((root.manifest && root.manifest.id) || "io.github.fivefold3.ip-config")
   }
 
   function toggle() {

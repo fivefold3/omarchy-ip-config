@@ -2,7 +2,7 @@
 # Stand-in for ip-config with the same interface, backed by a scratch file
 # instead of NetworkManager. Used to record the README demo without touching
 # real adapters. Open the plugin with it via:
-#   omarchy-shell shell summon ip-config '{"backend": "/path/to/demo/mock-backend"}'
+#   omarchy-shell shell summon io.github.fivefold3.ip-config '{"backend": "/path/to/demo/mock-backend"}'
 
 set -uo pipefail
 

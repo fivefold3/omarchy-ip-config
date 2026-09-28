@@ -20,7 +20,7 @@ key() { wtype -k "$1"; pause "${2:-0.7}"; }
 type_slowly() { wtype -d 70 "$1"; pause 0.6; }
 
 cleanup() {
-  omarchy-shell shell hide ip-config >/dev/null 2>&1 || true
+  omarchy-shell shell hide io.github.fivefold3.ip-config >/dev/null 2>&1 || true
   [[ -n ${recorder:-} ]] && kill -INT "$recorder" 2>/dev/null && wait "$recorder" 2>/dev/null
   focus_workspace "$return_ws"
   rm -f "$IP_CONFIG_DEMO_STATE"
@@ -35,7 +35,7 @@ gpu-screen-recorder -w "$monitor" -f 30 -cursor no -o "$out" >/dev/null 2>&1 &
 recorder=$!
 pause 1.5
 
-omarchy-shell shell summon ip-config "{\"backend\": \"$here/mock-backend\"}" >/dev/null
+omarchy-shell shell summon io.github.fivefold3.ip-config "{\"backend\": \"$here/mock-backend\"}" >/dev/null
 pause 1.8
 
 # Wired: set a static IP.

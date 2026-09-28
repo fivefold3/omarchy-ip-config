@@ -32,10 +32,27 @@ omarchy plugin add https://github.com/fivefold3/omarchy-ip-config --enable
 Then bind a key in `~/.config/hypr/bindings.lua`:
 
 ```lua
-o.bind("SUPER + N", "IP config", "omarchy-shell shell toggle ip-config")
+o.bind("SUPER + N", "IP config", "omarchy-shell shell toggle io.github.fivefold3.ip-config")
 ```
 
 If `SUPER + N` is already taken on your setup, call `hl.unbind("SUPER + N")` first, or pick another key.
+
+## Uninstall
+
+```sh
+omarchy plugin remove io.github.fivefold3.ip-config
+```
+
+Then delete the `o.bind(...)` line from `~/.config/hypr/bindings.lua`.
+
+If you turned on DHCP packet logging, turn it off again:
+
+```sh
+sudo rm /etc/NetworkManager/conf.d/90-ip-config-dhcp-log.conf
+sudo nmcli general logging level INFO domains DEFAULT
+```
+
+Saved static settings stay on your NetworkManager profiles under the `ip-config.static-ipv4` key. They're harmless, and other tools ignore them.
 
 ## Keys
 
@@ -70,7 +87,7 @@ Out of the box you get the connection stages, e.g. `Releasing old address…`, `
 **Optional: every packet.** NetworkManager only logs the individual DHCP packets (Discover, Offer, Request, Ack) at debug level. Changing that needs root, so the plugin never does it for you. To turn it on, run this once:
 
 ```sh
-~/.config/omarchy/plugins/ip-config/ip-config setup-logging
+~/.config/omarchy/plugins/io.github.fivefold3.ip-config/ip-config setup-logging
 ```
 
 That asks for your password, installs `extras/90-ip-config-dhcp-log.conf` into `/etc/NetworkManager/conf.d/`, and applies it immediately. It raises logging only for the DHCP part of NetworkManager. When renewing an address it already had, the client skips Discover and Offer, so you'll see only Request and Ack.

@@ -335,8 +335,15 @@ Item {
     return [row.device, ip, lease, status].filter(function(s) { return s }).join(" · ")
   }
 
-  // Load the adapters once up front so even the first open shows rows at once.
-  Component.onCompleted: root.refresh()
+  // Load the adapters once up front so even the first open shows rows at once,
+  // and, the first time only, offer the guided setup.
+  // Detached, since installing a plugin reloads it several times in a row and
+  // each reload would kill a child process. Always the bundled script: this
+  // runs at load, before any payload.
+  Component.onCompleted: {
+    root.refresh()
+    Quickshell.execDetached([root.bundledBackend, "offer-setup"])
+  }
 
   // --- Processes ---
 

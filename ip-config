@@ -13,6 +13,13 @@
 #   ip-config remove-logging        Undo setup-logging (root).
 #   ip-config prefill <dev>         Current static settings, or the ones saved by the last
 #                                   switch to DHCP, as "IP/mask gateway dns...".
+#   ip-config setup                 Guided setup, asking first about each step: add IP config
+#                                   to Setup > Network in the Omarchy menu, bind SUPER + ALT + N,
+#                                   and (optional, root) DHCP packet logging. --yes takes the
+#                                   first two without asking, and never the logging.
+#   ip-config remove-shortcuts      Undo the menu entry and key from setup.
+#   ip-config offer-setup           Run by the plugin on load: offers setup once, in a
+#                                   notification.
 #
 # dhcp and static report the connection stages while it comes back up, one
 # "status<TAB>text" line per stage. DHCP packet steps come from `watch`.
@@ -482,11 +489,309 @@ cmd_prefill() {
   fi
 }
 
+# Omarchy shortcuts: a "Setup > Network > IP config" menu row and a key.
+# They live in the user's own config files, so they're only ever added when
+# the user says yes, and every edit is held to these rules:
+#   - Only a block between this plugin's marker lines is added or removed;
+#     nothing else in the file changes, and a block that was edited by hand
+#     is left alone.
+#   - Files that are symlinks or belong to someone else aren't touched.
+#   - The menu file must parse the way the Omarchy menu parses it, before and
+#     after, with the same entries apart from ours.
+#   - Writes go through a temp file and a rename, and are abandoned if the
+#     file changed in the meantime.
+PLUGIN_ID=io.github.fivefold3.ip-config
+SHORTCUT_KEY="SUPER + ALT + N"
+BINDINGS_FILE=$HOME/.config/hypr/bindings.lua
+MENU_FILE=$HOME/.config/omarchy/extensions/omarchy-menu.jsonc
+OFFERED_FILE=${XDG_STATE_HOME:-$HOME/.local/state}/ip-config/setup-offered
+
+# shortcut_block <has|add|remove> <menu|key> <file>
+#   has: 0 = our block is there, 1 = it isn't, 3 = can't tell or can't edit.
+#   add/remove: 0 = done (or nothing to do), 3 = refused, with the reason on stderr.
+shortcut_block() {
+  python3 -I - "$@" "$PLUGIN_ID" "$SHORTCUT_KEY" <<'PY'
+import json, os, re, sys, tempfile
+
+op, kind, path, plugin_id, key = sys.argv[1:6]
+
+def refuse(msg):
+    print(f"{path}: {msg}", file=sys.stderr)
+    sys.exit(3)
+
+if kind == "menu":
+    begin, end = f"  // >>> {plugin_id} >>>", f"  // <<< {plugin_id} <<<"
+    entry_id = "setup.network.ip-config"
+    entry = {
+        "icon": "󰈀",
+        "label": "IP config",
+        "description": "DHCP or static IP per adapter",
+        "aliases": ["ip", "ipconfig", "static-ip"],
+        # Hides the row if the plugin is removed without remove-shortcuts.
+        "when": f"[[ -x ~/.config/omarchy/plugins/{plugin_id}/ip-config ]]",
+        "action": f"omarchy-shell shell summon {plugin_id}",
+    }
+    body = [f"  {json.dumps(entry_id)}: {json.dumps(entry, ensure_ascii=False, separators=(',', ':'))},"]
+else:
+    begin, end = f"-- >>> {plugin_id} >>>", f"-- <<< {plugin_id} <<<"
+    body = [f'o.bind("{key}", "IP config", "omarchy-shell shell toggle {plugin_id}")']
+
+# The Omarchy menu's own JSONC rules (MenuModel.stripJsonc): whole-line //
+# comments are dropped and trailing commas are allowed. Nothing more, so a
+# file it can't read is refused here too.
+def menu_entries(text):
+    stripped = re.sub(r"^\s*//[^\n]*(\n|$)", "", text, flags=re.M)
+    stripped = re.sub(r",(\s*[}\]])", r"\1", stripped)
+    if not stripped.strip():
+        return {}
+    try:
+        parsed = json.loads(stripped)
+    except ValueError:
+        refuse("the Omarchy menu can't read this file as it is; leaving it alone.")
+    if not isinstance(parsed, dict) or "items" in parsed:
+        refuse("unexpected layout; leaving it alone.")
+    return parsed
+
+def find_block(lines):
+    starts = [i for i, l in enumerate(lines) if l.rstrip("\n").strip() == begin.strip()]
+    ends = [i for i, l in enumerate(lines) if l.rstrip("\n").strip() == end.strip()]
+    if not starts and not ends:
+        return None
+    if len(starts) != 1 or len(ends) != 1 or ends[0] < starts[0]:
+        refuse("its IP config marker lines are out of order; edit it by hand.")
+    return starts[0], ends[0]
+
+if os.path.islink(path):
+    refuse("is a symlink; leaving it alone.")
+exists = os.path.exists(path)
+if exists:
+    st = os.stat(path)
+    if not os.path.isfile(path) or st.st_uid != os.getuid():
+        refuse("isn't a regular file of yours; leaving it alone.")
+    with open(path, encoding="utf-8") as f:
+        original = f.read()
+elif kind == "menu" and op == "add":
+    original = "{\n}\n"
+else:
+    if op == "add":
+        refuse("doesn't exist.")
+    sys.exit(1 if op == "has" else 0)
+
+lines = original.splitlines(keepends=True)
+block = find_block(lines)
+
+if op == "has":
+    sys.exit(0 if block else 1)
+
+def write(text):
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".ip-config.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, (os.stat(path).st_mode & 0o7777) if exists else 0o644)
+        if exists:
+            with open(path, encoding="utf-8") as f:
+                if os.path.islink(path) or f.read() != original:
+                    refuse("changed while it was being edited; try again.")
+        elif os.path.lexists(path):
+            refuse("appeared while it was being edited; try again.")
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+if op == "add":
+    if block:
+        sys.exit(0)
+    if kind == "menu":
+        before = menu_entries(original)
+        if entry_id in before:
+            refuse(f"already has a {entry_id} entry; leaving it alone.")
+        # Insert before the object's closing brace, adding a comma first if
+        # the entry before it doesn't end with one.
+        live = re.sub(r"^\s*//[^\n]*$", lambda m: " " * len(m.group(0)), original, flags=re.M)
+        close = live.rfind("}")
+        if close < 0:
+            refuse("has no closing brace; leaving it alone.")
+        prev = live[:close].rstrip()
+        comma = [] if prev.endswith(("{", ",")) else ["  ,"]
+        head = original[:close]
+        if not head.endswith("\n"):
+            head += "\n"
+        text = head + "\n".join([begin] + comma + body + [end]) + "\n" + original[close:]
+        expected = dict(before)
+        expected[entry_id] = entry
+        if menu_entries(text) != expected:
+            refuse("couldn't add the entry cleanly; leaving it alone.")
+    else:
+        text = original
+        if text and not text.endswith("\n"):
+            text += "\n"
+        text += "\n" + "\n".join([begin] + body + [end]) + "\n"
+    write(text)
+    sys.exit(0)
+
+# remove
+if not block:
+    sys.exit(0)
+start, stop = block
+inside = [l.rstrip("\n") for l in lines[start + 1:stop]]
+# The key block must be exactly ours. The menu block is checked by parsing
+# instead, so a block written by an older version still comes out.
+if kind == "key" and inside != body:
+    refuse("the IP config block was edited by hand; remove it yourself.")
+if kind == "menu":
+    try:
+        ours = json.loads("{" + "".join(inside).strip().strip(",") + "}")
+    except ValueError:
+        ours = None
+    if not isinstance(ours, dict) or list(ours) != [entry_id]:
+        refuse("the IP config block was edited by hand; remove it yourself.")
+# Also take the blank line `add` put before the key block.
+if kind == "key" and start > 0 and not lines[start - 1].strip():
+    start -= 1
+text = "".join(lines[:start] + lines[stop + 1:])
+if kind == "menu":
+    expected = menu_entries(original)
+    expected.pop(entry_id, None)
+    if menu_entries(text) != expected:
+        refuse("removing the entry would change other entries; remove it yourself.")
+write(text)
+PY
+}
+
+# What SHORTCUT_KEY is bound to right now, if anything. Fails if Hyprland
+# can't be asked.
+key_binding() {
+  local binds
+  binds=$(hyprctl binds -j 2>/dev/null) || return 1
+  # SUPER (64) + ALT (8); key names are reported as typed, so compare loosely.
+  jq -er 'map(select(.modmask == 72 and (.key | ascii_upcase) == "N" and (.submap // "") == ""))
+    | if length == 0 then "" else (.[0].description // "" | if . == "" then "something" else . end) end' <<<"$binds"
+}
+
+# Yes/no in the terminal; --yes answers yes, and without a terminal it's no.
+ask() {
+  ((ASSUME_YES)) && return 0
+  [[ -t 0 && -t 1 ]] || return 1
+  if command -v gum >/dev/null; then
+    gum confirm "$1"
+  else
+    local reply
+    read -rp "$1 [y/N] " reply && [[ $reply == [yY]* ]]
+  fi
+}
+
+cmd_setup() {
+  local rc bound errors_before errors_after
+  ASSUME_YES=0
+  [[ ${1:-} == --yes || ${1:-} == -y ]] && ASSUME_YES=1
+  if ((! ASSUME_YES)) && ! [[ -t 0 && -t 1 ]]; then
+    echo "Run this in a terminal, or pass --yes." >&2
+    return 1
+  fi
+  mkdir -p "${OFFERED_FILE%/*}" && touch "$OFFERED_FILE"
+
+  shortcut_block has menu "$MENU_FILE"
+  rc=$?
+  if ((rc == 0)); then
+    echo "Already in Setup › Network."
+  elif ((rc == 1)) && ask "Add IP config to Setup › Network in the Omarchy menu?"; then
+    shortcut_block add menu "$MENU_FILE" && echo "Added to Setup › Network."
+  fi
+
+  shortcut_block has key "$BINDINGS_FILE"
+  rc=$?
+  if ((rc == 0)); then
+    echo "$SHORTCUT_KEY already opens IP config."
+  elif ((rc == 1)); then
+    if ! bound=$(key_binding); then
+      echo "Couldn't ask Hyprland about $SHORTCUT_KEY; not binding it." >&2
+    elif [[ -n $bound ]]; then
+      echo "$SHORTCUT_KEY is already bound ($bound); leaving it. Bind another key in $BINDINGS_FILE if you like."
+    elif ask "Bind $SHORTCUT_KEY to open IP config?"; then
+      errors_before=$(hyprctl configerrors 2>/dev/null)
+      if shortcut_block add key "$BINDINGS_FILE"; then
+        hyprctl reload >/dev/null 2>&1
+        errors_after=$(hyprctl configerrors 2>/dev/null)
+        if [[ $errors_after != "$errors_before" ]]; then
+          shortcut_block remove key "$BINDINGS_FILE"
+          hyprctl reload >/dev/null 2>&1
+          echo "Hyprland reported a config error after binding $SHORTCUT_KEY, so it was taken out again:" >&2
+          echo "$errors_after" >&2
+          return 1
+        fi
+        echo "$SHORTCUT_KEY now opens IP config."
+      fi
+    fi
+  fi
+
+  # Root, so never on --yes: only when asked in the terminal. setup-logging
+  # makes its own checks and asks for the password itself.
+  if [[ -f $LOG_CONF ]] && grep -qxF "$LOG_MARKER" "$LOG_CONF" 2>/dev/null && read_logging && dhcp4_debug; then
+    echo "DHCP packet logging is already on."
+  elif ((! ASSUME_YES)) && ask "Optional: also show every DHCP packet (Discover, Offer, Request, Ack)? Requires sudo to enable."; then
+    cmd_setup_logging
+  fi
+  return 0
+}
+
+cmd_remove_shortcuts() {
+  local failed=0
+  shortcut_block remove menu "$MENU_FILE" || failed=1
+  if shortcut_block has key "$BINDINGS_FILE"; then
+    if shortcut_block remove key "$BINDINGS_FILE"; then
+      hyprctl reload >/dev/null 2>&1
+    else
+      failed=1
+    fi
+  fi
+  ((failed)) && return 1
+  echo "IP config shortcuts removed."
+}
+
+# Once, the first time the plugin loads: offer setup in a notification.
+# Nothing is changed unless the user clicks it, and that opens a terminal
+# where each change is asked about again.
+cmd_offer_setup() {
+  local self choice
+  # Created exclusively (noclobber), so when several reloads start this at
+  # once only one of them gets past here.
+  mkdir -p "${OFFERED_FILE%/*}" 2>/dev/null || return 0
+  (set -C; : >"$OFFERED_FILE") 2>/dev/null || return 0
+  shortcut_block has menu "$MENU_FILE" 2>/dev/null && shortcut_block has key "$BINDINGS_FILE" 2>/dev/null && return 0
+  # The plugin loads with the shell, which is also the notification server,
+  # so give that a moment to come up. If it never does, or sending fails,
+  # hand the marker back so the offer is made on a later load instead.
+  for _ in {1..60}; do
+    gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
+      --method org.freedesktop.DBus.NameHasOwner org.freedesktop.Notifications 2>/dev/null | grep -q true && break
+    sleep 0.5
+  done
+  # Clicking the notification is the "default" action; Omarchy's notifications
+  # show no buttons, so that's the only choice. Dismissing it is "no".
+  if ! choice=$(notify -A default="Set up" "IP config" \
+    "Click to add it to Setup › Network, bind $SHORTCUT_KEY and choose optional DHCP logging. Or later: ip-config setup"); then
+    rm -f "$OFFERED_FILE"
+    return 0
+  fi
+  [[ $choice == default ]] || return 0
+  self=$(realpath "${BASH_SOURCE[0]}") || return 0
+  omarchy-launch-floating-terminal-with-presentation "$(printf '%q' "$self") setup"
+}
+
 case "${1:-}" in
   list) cmd_list ;;
   watch) cmd_watch ;;
   setup-logging) cmd_setup_logging ;;
   remove-logging) cmd_remove_logging ;;
+  setup) cmd_setup "${2:-}" ;;
+  remove-shortcuts) cmd_remove_shortcuts ;;
+  offer-setup) cmd_offer_setup ;;
   toggle | dhcp | prefill) [[ -n ${2:-} ]] && "cmd_$1" "$2" ;;
   static) [[ -n ${2:-} ]] && cmd_static "$2" "${3:-}" ;;
   *)

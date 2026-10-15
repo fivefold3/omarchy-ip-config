@@ -29,21 +29,45 @@ These all come with a standard Omarchy install.
 omarchy plugin add https://github.com/fivefold3/omarchy-ip-config --enable
 ```
 
-Then bind a key in `~/.config/hypr/bindings.lua`:
+The first time the plugin loads, a notification offers a guided setup. Clicking it opens a terminal that asks about each step before it does anything:
+
+1. Add IP config to the Omarchy menu under **Setup › Network**.
+2. Bind `SUPER + ALT + N` to open it.
+3. Optional: show every DHCP packet. Requires sudo to enable; see [DHCP progress](#dhcp-progress).
+
+Nothing is changed if you dismiss or ignore the notification, and you're only asked once. You can run the same setup any time:
+
+```sh
+~/.config/omarchy/plugins/io.github.fivefold3.ip-config/ip-config setup
+```
+
+`setup --yes` does steps 1 and 2 without asking, and never step 3.
+
+Steps 1 and 2 change these files, and nothing more:
+
+- **Setup › Network › IP config:** one entry in `~/.config/omarchy/extensions/omarchy-menu.jsonc` (the file is created if it doesn't exist).
+- **`SUPER + ALT + N`:** one `o.bind(...)` line in `~/.config/hypr/bindings.lua`. If that key is already bound, it's left alone and you're told what it's bound to. If Hyprland reports a config error afterwards, the line is taken out again.
+
+Each addition sits between two marker lines naming this plugin, so `remove-shortcuts` can find it and take out exactly that. Files that are symlinks or belong to another user aren't touched. The menu file is checked before and after the change, using the same rules the Omarchy menu uses to read it, and it must still hold the same entries apart from this one. Files are written through a temp file and a rename, and the write is abandoned if the file changed in the meantime.
+
+To use another key, add a binding of your own instead:
 
 ```lua
 o.bind("SUPER + N", "IP config", "omarchy-shell shell toggle io.github.fivefold3.ip-config")
 ```
 
-If `SUPER + N` is already taken on your setup, call `hl.unbind("SUPER + N")` first, or pick another key.
+If that key is already taken on your setup, call `hl.unbind("SUPER + N")` first.
 
 ## Uninstall
 
+Remove the menu entry and key first, then the plugin:
+
 ```sh
+~/.config/omarchy/plugins/io.github.fivefold3.ip-config/ip-config remove-shortcuts
 omarchy plugin remove io.github.fivefold3.ip-config
 ```
 
-Then delete the `o.bind(...)` line from `~/.config/hypr/bindings.lua`.
+`remove-shortcuts` only removes the blocks between this plugin's marker lines. If you edited a block by hand, it leaves that block alone and tells you, and you can delete it yourself. If you removed the plugin first, the menu entry hides itself. Delete the `io.github.fivefold3.ip-config` blocks from the two files above by hand. If you added your own `o.bind(...)` line, delete that too.
 
 If you turned on DHCP packet logging, turn it off again first:
 
@@ -85,7 +109,7 @@ While the menu is open, it follows NetworkManager's journal and shows DHCP progr
 
 Out of the box you get the connection stages, e.g. `Releasing old address…`, `Starting DHCP…` and `Checking for conflicts…`.
 
-**Optional: every packet.** NetworkManager only logs the individual DHCP packets (Discover, Offer, Request, Ack) at debug level. Changing that needs root, so the plugin never does it for you. To turn it on, run this once:
+**Optional: every packet.** NetworkManager only logs the individual DHCP packets (Discover, Offer, Request, Ack) at debug level. Changing that needs root, so it only happens when you ask for it. To turn it on, say yes to it in `ip-config setup`, or run this once:
 
 ```sh
 ~/.config/omarchy/plugins/io.github.fivefold3.ip-config/ip-config setup-logging
@@ -111,6 +135,8 @@ ip-config prefill eth0          # what the static prompt would open with
 ip-config watch                 # DHCP progress for all adapters, as it happens
 ip-config setup-logging         # optional, see above
 ip-config remove-logging        # undo setup-logging
+ip-config setup                 # guided: Setup › Network entry, SUPER + ALT + N, optional DHCP logging
+ip-config remove-shortcuts      # undo the menu entry and key
 ```
 
 `static` and `dhcp` report their stages as `status<TAB>text` lines while the connection comes back up. `watch` reports DHCP steps as `event<TAB>device<TAB>text` lines, where empty text means the lease is done.
